@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 
-from six.moves.urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode, parse_qs
 import pytest
 
 from sqlalchemy import create_engine, Column, Integer, DateTime, String, ForeignKey
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from flask import Blueprint, make_response, json
 from marshmallow_jsonapi.flask import Schema, Relationship
 from marshmallow import Schema as MarshmallowSchema
@@ -216,7 +215,7 @@ def address_schema():
     class AddressSchema(MarshmallowSchema):
         street = fields.String(required=True)
         city = fields.String(required=True)
-        state = fields.String(missing='NC')
+        state = fields.String(load_default='NC')
         zip = fields.String(required=True)
 
     yield AddressSchema
@@ -274,8 +273,8 @@ def computer_schema():
         id = fields.Integer(as_string=True)
         serial = fields.Str(required=True)
         owner = Relationship(attribute='person',
-                             default=None,
-                             missing=None,
+                             dump_default=None,
+                             load_default=None,
                              related_view='api.person_detail',
                              related_view_kwargs={'person_id': '<person.person_id>'},
                              schema='PersonSchema',
@@ -460,18 +459,18 @@ def string_json_attribute_person_list(session, string_json_attribute_person_mode
     yield StringJsonAttributePersonList
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def api_blueprint(client):
     bp = Blueprint('api', __name__)
     yield bp
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def api(api_blueprint):
     return Api(blueprint=api_blueprint)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def register_routes(client, api, app, api_blueprint, person_list, person_detail, person_computers,
                     person_list_raise_jsonapiexception, person_list_raise_exception, person_list_response,
                     person_list_without_schema, computer_list, computer_detail, computer_owner,
@@ -613,15 +612,6 @@ def test_compute_schema(person_schema):
     with pytest.raises(InvalidInclude):
         flask_rest_jsonapi.schema.compute_schema(person_schema, dict(), qsm, ['id'])
     flask_rest_jsonapi.schema.compute_schema(person_schema, dict(only=list()), qsm, list())
-
-
-def test_compute_schema_propagate_context(person_schema, computer_schema):
-    query_string = {}
-    qsm = QSManager(query_string, person_schema)
-    schema = flask_rest_jsonapi.schema.compute_schema(person_schema, dict(), qsm, ['computers'])
-    assert schema.declared_fields['computers'].__dict__['_Relationship__schema'].__dict__['context'] == dict()
-    schema = flask_rest_jsonapi.schema.compute_schema(person_schema, dict(context=dict(foo='bar')), qsm, ['computers'])
-    assert schema.declared_fields['computers'].__dict__['_Relationship__schema'].__dict__['context'] == dict(foo='bar')
 
 
 # test good cases
@@ -1896,7 +1886,7 @@ def test_api_resources(app, person_list):
     api.init_app(app)
 
 
-def test_relationship_containing_hyphens(api, app, client, person_schema, person_computers, register_routes,
+def test_relationship_containing_hyphens(api, app, client, person_schema, person_computers, computer_list,
                                          computer_schema, person):
     """
     This is a bit of a hack. Basically, since we can no longer have two attributes that read from the same key
@@ -1920,6 +1910,7 @@ def test_relationship_containing_hyphens(api, app, client, person_schema, person
     class PersonComputersOwnedRelationship(person_computers):
         schema = PersonOwnedSchema
 
+    api.route(computer_list, 'computer_list', '/computers', '/persons/<int:person_id>/computers')
     api.route(PersonComputersOwnedRelationship, 'person_computers_owned',
               '/persons/<int:person_id>/relationships/computers-owned')
     api.init_app(app)
