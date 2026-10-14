@@ -7,7 +7,7 @@ setup(
     version=__version__,
     description='Flask extension to create REST web api according to JSONAPI 1.0 specification with Flask, Marshmallow \
                  and data provider of your choice (SQLAlchemy, MongoDB, ...)',
-    url='https://github.com/miLibris/flask-rest-jsonapi',
+    url='https://github.com/mmswire/flask-rest-jsonapi',
     author='miLibris API Team',
     author_email='pf@milibris.net',
     license='MIT',
@@ -25,7 +25,7 @@ setup(
     platforms='any',
     install_requires=[
         'Flask',
-        'marshmallow',
+        'marshmallow>=3.8.0,<4',
         'marshmallow_jsonapi',
         'sqlalchemy'
     ],
@@ -33,9 +33,7 @@ setup(
     tests_require=['pytest'],
     extras_require={
         'dev': [
-            'pytest',
-            'coveralls',
-            'coverage'
+            'pytest'
         ],
         'docs': 'sphinx'
     }

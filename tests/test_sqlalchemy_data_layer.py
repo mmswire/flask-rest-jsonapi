@@ -314,7 +314,7 @@ def person_list(session, person_model, dummy_decorator, person_schema, before_cr
         schema = person_schema
         data_layer = {'model': person_model,
                       'session': session,
-                      'mzthods': {'before_create_object': before_create_object}}
+                      'methods': {'before_create_object': before_create_object}}
         get_decorators = [dummy_decorator]
         post_decorators = [dummy_decorator]
         get_schema_kwargs = dict()
@@ -397,7 +397,7 @@ def person_list_without_schema(session, person_model):
 
 
 @pytest.fixture(scope="module")
-def query():
+def query(computer_model, person_model):
     def query_(self, view_kwargs):
         if view_kwargs.get('person_id') is not None:
             return self.session.query(computer_model).join(person_model).filter_by(person_id=view_kwargs['person_id'])
@@ -484,7 +484,7 @@ def register_routes(client, api, app, api_blueprint, person_list, person_detail,
     api.route(person_list_response, 'person_list_response', '/persons_response')
     api.route(person_list_without_schema, 'person_list_without_schema', '/persons_without_schema')
     api.route(computer_list, 'computer_list', '/computers', '/persons/<int:person_id>/computers')
-    api.route(computer_list, 'computer_detail', '/computers/<int:id>')
+    api.route(computer_detail, 'computer_detail', '/computers/<int:id>')
     api.route(computer_owner, 'computer_owner', '/computers/<int:id>/relationships/owner')
     api.route(string_json_attribute_person_list, 'string_json_attribute_person_list', '/string_json_attribute_persons')
     api.route(string_json_attribute_person_detail, 'string_json_attribute_person_detail',
@@ -788,6 +788,30 @@ def test_get_detail(client, register_routes, person):
     with client:
         response = client.get('/persons/' + str(person.person_id), content_type='application/vnd.api+json')
         assert response.status_code == 200, response.json['errors']
+
+
+def test_get_computer_detail(client, register_routes, computer):
+    with client:
+        response = client.get('/computers/' + str(computer.id), content_type='application/vnd.api+json')
+        assert response.status_code == 200, response.json['errors']
+        assert response.json['data']['attributes']['serial'] == '1'
+
+
+def test_get_person_computers(client, register_routes, session, computer_model, person, computer):
+    computer.person = person
+    # a computer of nobody's, so an unfiltered query can't pass
+    other = computer_model(serial='other')
+    session.add(other)
+    session.commit()
+    try:
+        with client:
+            response = client.get('/persons/{}/computers'.format(person.person_id),
+                                  content_type='application/vnd.api+json')
+            assert response.status_code == 200, response.json['errors']
+            assert [item['id'] for item in response.json['data']] == [str(computer.id)]
+    finally:
+        session.delete(other)
+        session.commit()
 
 
 def test_patch_detail(client, register_routes, computer, person):

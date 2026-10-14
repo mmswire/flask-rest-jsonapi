@@ -3,9 +3,16 @@
 """Known security issues, recorded as strict xfail tests
 
 Each test states the behaviour we want and fails on purpose until the issue in its reason is fixed. strict=True makes
-the suite fail once one starts passing, so whoever fixes the issue has to remove its marker.
+the suite fail once one starts passing, so whoever fixes the issue has to remove its marker. Parametrized cases with
+different causes carry their own marker, so fixing one cause flips only its cases.
+
+raises=AssertionError only stops an error raised in the test itself (a fixture or helper failing, a KeyError on a
+changed response shape) from counting as the expected failure. The library turns a server-side exception into a 500
+response, which fails a status assertion just as the issue does, so the control test at the top must exercise every
+route, method and query feature the xfails use.
 """
 
+import functools
 import json
 import logging
 
@@ -19,12 +26,22 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from flask_rest_jsonapi import Api, ResourceList, ResourceDetail
 from flask_rest_jsonapi.data_layers.alchemy import SqlalchemyDataLayer
 
+known_issue = functools.partial(pytest.mark.xfail, strict=True, raises=AssertionError)
+
+
+def case(*values, reason, id):
+    return pytest.param(*values, marks=known_issue(reason=reason), id=id)
+
+
 OPERATOR_ALLOWLIST = 'filter op can call any column method'
-FIELDS_OUTSIDE_SCHEMA = 'filters and sort reach fields outside the schema'
 RELATIONSHIP_SCOPE = 'any/has filters bypass loader-criteria scoping'
-ERROR_LEAK = 'database errors leak SQL and bound values'
-INCLUDE_DEPTH = 'MAX_INCLUDE_DEPTH is never enforced'
-MALFORMED_INPUT = 'malformed querystrings and bodies return 500'
+ERROR_LEAK = 'database write errors leak SQL and bound values'
+UNEXPECTED_ERROR_LEAK = 'unexpected errors return str(e) as the error detail'
+NO_ERROR_LOG = 'write failures are not logged'
+INCLUDE_DEPTH = 'MAX_INCLUDE_DEPTH of 2 or more is never enforced'
+LOST_DECORATORS = "subclasses lose their parent resource's decorators (e.g. authentication)"
+API_DECORATORS = 'Api(decorators=...) is never applied to routes'
+PAGINATION_BOUNDS = 'negative or zero page[size] passes the MAX_PAGE_SIZE check and returns every row'
 
 Base = declarative_base()
 
@@ -66,7 +83,7 @@ class XfUserSchema(Schema):
 
 
 class XfExcludedUserSchema(Schema):
-    """Hides a column with Meta.exclude, the way schemas generated from models do"""
+    """Declares a field but hides it with Meta.exclude; marshmallow keeps it in _declared_fields"""
 
     class Meta:
         type_ = 'xf_user_excluded'
@@ -185,9 +202,34 @@ def assert_no_leak(response):
         assert fragment not in body, body
 
 
+def test_fixture_endpoints_work(client):
+    # control: if the fixtures break, the xfails below would fail for the wrong reason and still pass as expected
+    assert names(get(client, '/users')) == ['alice', 'bob']
+    assert names(get(client, '/groups')) == ['admins', 'users']
+    for path in ('/excluded_users', '/scoped_users', '/users/1'):
+        response = get(client, path)
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+    # the filter, sort, include and write paths the xfails below rely on
+    assert names(get(client, '/users', filter=[{'name': 'name', 'op': 'eq', 'val': 'alice'}])) == ['alice']
+    assert names(get(client, '/users', filter=[{'name': 'name', 'op': 'like', 'val': 'b%'}])) == ['bob']
+    scoped = get(client, '/scoped_users',
+                 filter=[{'name': 'group', 'op': 'has', 'val': {'name': 'name', 'op': 'eq', 'val': 'users'}}])
+    assert names(scoped) == ['bob']
+    assert [item['attributes']['name'] for item in get(client, '/users', sort='-name').json['data']] == ['bob', 'alice']
+    assert get(client, '/users', include='group.members').status_code == 200
+
+    patch = {'data': {'type': 'xf_user', 'id': '2', 'attributes': {'nickname': 'bobby'}}}
+    assert send(client, 'PATCH', '/users/2', patch).status_code == 200
+    # create and delete again, so the module-scoped database is left as it was
+    created = send(client, 'POST', '/users', {'data': {'type': 'xf_user', 'attributes': {'name': 'carol'}}})
+    assert created.status_code == 201, created.get_data(as_text=True)
+    assert send(client, 'DELETE', '/users/' + created.json['data']['id'], {}).status_code == 200
+
+
 # filter operators
 
-@pytest.mark.xfail(strict=True, reason=OPERATOR_ALLOWLIST)
+@known_issue(reason=OPERATOR_ALLOWLIST)
 @pytest.mark.parametrize('op', ['op', 'collate', 'regexp_match', '__eq__', 'startswith', 'match', 'concat',
                                 'contains', 'endswith'])
 def test_operator_outside_allowlist_is_rejected(client, op):
@@ -197,117 +239,204 @@ def test_operator_outside_allowlist_is_rejected(client, op):
 
 # fields outside the schema
 
-@pytest.mark.xfail(strict=True, reason=FIELDS_OUTSIDE_SCHEMA)
 @pytest.mark.parametrize('filt', [
-    # `field` is looked up on the model, not the schema: compares users.name to users.password_hash
-    {'name': 'name', 'op': 'eq', 'field': 'password_hash'},
-    # name__sub passes sub to has() unchecked: equality oracle on any column of the related model
-    {'name': 'group__secret', 'op': 'has', 'val': 's3cr3t'},
-    # load_only fields are never returned, so they must not be filterable either
-    {'name': 'password', 'op': 'like', 'val': 'hash-a%'},
-    # Meta.exclude hides the field from responses but leaves it in _declared_fields
-    {'name': 'group', 'op': 'has', 'val': {'name': 'secret', 'op': 'eq', 'val': 's3cr3t'}},
+    case({'name': 'name', 'op': 'eq', 'field': 'password_hash'},
+         reason='filter field is looked up on the model, not the schema', id='field-on-model'),
+    case({'name': 'group__secret', 'op': 'has', 'val': 's3cr3t'},
+         reason='fields hidden with Meta.exclude can be filtered', id='related-subfield-excluded'),
+    case({'name': 'password', 'op': 'like', 'val': 'hash-a%'},
+         reason='load_only fields can be filtered', id='load-only'),
+    case({'name': 'group', 'op': 'has', 'val': {'name': 'secret', 'op': 'eq', 'val': 's3cr3t'}},
+         reason='fields hidden with Meta.exclude can be filtered', id='related-excluded'),
+    # passes today only because the model has no `password` attribute; mapping `field` through the schema must not
+    # open the load_only column it maps to, so this case has no marker
+    pytest.param({'name': 'name', 'op': 'lt', 'field': 'password'}, id='field-load-only'),
 ])
 def test_filter_outside_public_schema_is_rejected(client, filt):
     response = get(client, '/users', filter=[filt])
     assert response.status_code == 400, response.get_data(as_text=True)
 
 
-@pytest.mark.xfail(strict=True, reason=FIELDS_OUTSIDE_SCHEMA)
+@known_issue(reason='name__x passes x to any()/has() without a schema check')
+def test_related_subfield_outside_schema_is_rejected(client):
+    # password_hash is a model column XfUserSchema never declares (it only exposes it as the load_only `password`)
+    response = get(client, '/groups', filter=[{'name': 'members__password_hash', 'op': 'any', 'val': 'hash-a'}])
+    assert response.status_code == 400, response.get_data(as_text=True)
+
+
 @pytest.mark.parametrize('params', [
-    {'filter': [{'name': 'password_hash', 'op': 'like', 'val': 'hash-a%'}]},
-    {'sort': 'password_hash'},
+    case({'filter': [{'name': 'password_hash', 'op': 'like', 'val': 'hash-a%'}]},
+         reason='fields hidden with Meta.exclude can be filtered', id='filter'),
+    case({'sort': 'password_hash'},
+         reason='fields hidden with Meta.exclude can be sorted', id='sort'),
 ])
 def test_excluded_field_is_rejected(client, params):
     response = get(client, '/excluded_users', **params)
     assert response.status_code == 400, response.get_data(as_text=True)
 
 
-@pytest.mark.xfail(strict=True, reason=FIELDS_OUTSIDE_SCHEMA)
+@known_issue(reason='load_only fields can be sorted')
 def test_sort_on_load_only_field_is_rejected(client):
     assert get(client, '/users', sort='password').status_code == 400
 
 
 # relationship filters and tenant scoping
 
-@pytest.mark.xfail(strict=True, reason=RELATIONSHIP_SCOPE)
-@pytest.mark.parametrize('filt', [
-    {'name': 'group', 'op': 'has', 'val': {'name': 'name', 'op': 'eq', 'val': 'admins'}},
-    {'name': 'group__name', 'op': 'has', 'val': 'admins'},
-])
-def test_relationship_filter_can_be_scoped(client, filt):
+@known_issue(reason=RELATIONSHIP_SCOPE)
+@pytest.mark.parametrize('make_filter', [
+    lambda group: {'name': 'group', 'op': 'has', 'val': {'name': 'name', 'op': 'eq', 'val': group}},
+    lambda group: {'name': 'group__name', 'op': 'has', 'val': group},
+], ids=['nested', 'subfield'])
+def test_relationship_filter_can_be_scoped(client, make_filter):
     # with_loader_criteria doesn't reach the EXISTS subquery of any/has, so the data layer needs a way to scope it
-    response = get(client, '/scoped_users', filter=[filt])
+    visible = get(client, '/scoped_users', filter=[make_filter('users')])
+    assert names(visible) == ['bob'], visible.get_data(as_text=True)
+    response = get(client, '/scoped_users', filter=[make_filter('admins')])
     assert response.status_code == 200, response.get_data(as_text=True)
     assert names(response) == []
 
 
-# error details in responses
+# error details in responses and logs
 
-@pytest.mark.xfail(strict=True, reason=ERROR_LEAK)
+@known_issue(reason=ERROR_LEAK)
 def test_write_error_does_not_leak_sql(client, session):
     body = {'data': {'type': 'xf_user', 'attributes': {'name': 'alice', 'password': 'leaked-secret'}}}
     response = send(client, 'POST', '/users', body)
     session.rollback()
-    assert response.status_code == 500
+    assert response.status_code in (409, 500)
     assert_no_leak(response)
     assert 'leaked-secret' not in response.get_data(as_text=True)
 
 
-@pytest.mark.xfail(strict=True, reason=ERROR_LEAK)
+@known_issue(reason=UNEXPECTED_ERROR_LEAK)
 def test_unexpected_error_does_not_leak(client):
     response = get(client, '/broken')
     assert response.status_code == 500
     assert_no_leak(response)
 
 
-@pytest.mark.xfail(strict=True, reason=ERROR_LEAK)
 def test_write_error_log_has_no_bound_values(client, session, caplog):
+    # passes today; guards against a fix that logs the failed statement together with its bound values
     body = {'data': {'type': 'xf_user', 'attributes': {'name': 'alice', 'password': 'leaked-secret'}}}
-    with caplog.at_level(logging.ERROR):
-        send(client, 'POST', '/users', body)
+    with caplog.at_level(logging.DEBUG):
+        response = send(client, 'POST', '/users', body)
     session.rollback()
-    # the failure must be logged for diagnosis, without the values bound into the statement
-    assert 'IntegrityError' in caplog.text
+    assert response.status_code in (409, 500), response.get_data(as_text=True)
     assert 'leaked-secret' not in caplog.text
+
+
+@known_issue(reason=NO_ERROR_LOG)
+def test_write_error_is_logged(client, session, caplog):
+    body = {'data': {'type': 'xf_user', 'attributes': {'name': 'alice', 'password': 'leaked-secret'}}}
+    with caplog.at_level(logging.WARNING):
+        response = send(client, 'POST', '/users', body)
+    session.rollback()
+    assert response.status_code in (409, 500), response.get_data(as_text=True)
+    assert 'IntegrityError' in caplog.text
 
 
 # include depth
 
-@pytest.mark.xfail(strict=True, reason=INCLUDE_DEPTH)
+@known_issue(reason=INCLUDE_DEPTH)
 def test_include_depth_limit_is_enforced(app, client):
-    # the check walks the characters of the include string, so only a limit of 1 ever trips (on the '.')
+    # the check walks the characters of the include string, so only limits 0 and 1 ever trip
     app.config['MAX_INCLUDE_DEPTH'] = 2
     assert get(client, '/users', include='group.members').status_code == 200
+    # each path is within the limit; a check that counts dots across the whole string would reject this
+    assert get(client, '/users', include='group.members,group.members').status_code == 200
     assert get(client, '/users', include='group.members.group').status_code == 400
+
+
+# resource classes
+
+@known_issue(reason=LOST_DECORATORS)
+def test_subclass_keeps_parent_decorators(app, client, session):
+    calls = []
+
+    def deco(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            calls.append(view.__name__)
+            return view(*args, **kwargs)
+        return wrapper
+
+    class AuthedList(ResourceList):
+        decorators = (deco,)
+
+    class SubUserList(AuthedList):
+        schema = XfUserSchema
+        data_layer = {'session': session, 'model': XfUser}
+
+    Api(app).route(SubUserList, 'xf_sub_user_list', '/sub_users')
+    assert get(client, '/sub_users').status_code == 200
+    assert calls == ['xf_sub_user_list']
+
+
+@known_issue(reason=API_DECORATORS)
+def test_api_decorators_are_applied(app, client, session):
+    calls = []
+
+    def deco(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            calls.append(view.__name__)
+            return view(*args, **kwargs)
+        return wrapper
+
+    class DecoratedUserList(ResourceList):
+        schema = XfUserSchema
+        data_layer = {'session': session, 'model': XfUser}
+
+    # documented as the way to put e.g. login_required on every endpoint
+    Api(app, decorators=(deco,)).route(DecoratedUserList, 'xf_decorated_user_list', '/decorated_users')
+    assert get(client, '/decorated_users').status_code == 200
+    assert calls == ['xf_decorated_user_list']
+
+
+# pagination bounds
+
+@known_issue(reason=PAGINATION_BOUNDS)
+@pytest.mark.parametrize('size', ['-1', '0'])
+def test_page_size_respects_max_page_size(app, client, size):
+    app.config['MAX_PAGE_SIZE'] = 1
+    # -1 becomes LIMIT -1 and 0 disables pagination; both pass the `> MAX_PAGE_SIZE` check and return every row
+    response = get(client, '/users', **{'page[size]': size})
+    assert response.status_code == 400, response.get_data(as_text=True)
 
 
 # malformed input
 
-@pytest.mark.xfail(strict=True, reason=MALFORMED_INPUT)
 @pytest.mark.parametrize('params', [
-    {'page[size]': '-1'},
-    {'page[number]': '0'},
-    {'page[size]': '1,2'},
-    {'fields[no_such_type]': 'name'},
-    {'filter': '{"name": "name", "op": "eq", "val": "x"}'},
-    {'filter': [{'name': 'name', 'op': 'eq', 'val': 10 ** 40}]},
-    {'filter': [{'name': 'group', 'op': 'eq', 'val': 1}]},
-    {'filter': [{'name': 'group', 'op': 'any', 'val': {'name': 'name', 'op': 'eq', 'val': 'x'}}]},
-    {'filter': [{'or': []}]},
-    {'filter': '[' + '{"not": ' * 5000 + '{"name": "name", "op": "eq", "val": "x"}' + '}' * 5000 + ']'},
+    case({'page[size]': '-1'}, reason='a negative page[size] becomes LIMIT -1 and returns every row',
+         id='negative-page-size'),
+    case({'page[number]': '0'}, reason='page[number] below 1 becomes a negative OFFSET instead of a 400',
+         id='zero-page-number'),
+    case({'page[size]': '1,2'}, reason='page values that are lists crash with 500', id='list-page-size'),
+    case({'fields[no_such_type]': 'name'}, reason='unknown fields[type] crashes with 500', id='unknown-type'),
+    case({'filter': '{"name": "name", "op": "eq", "val": "x"}'},
+         reason='a filter that is not a list crashes with 500', id='filter-not-list'),
+    case({'filter': [{'name': 'name', 'op': 'eq', 'val': 10 ** 40}]},
+         reason='filter values the database cannot bind crash with 500', id='int-overflow'),
+    case({'filter': [{'name': 'group', 'op': 'eq', 'val': 1}]},
+         reason='comparing a relationship with eq crashes with 500', id='relationship-eq'),
+    case({'filter': [{'name': 'group', 'op': 'any', 'val': {'name': 'name', 'op': 'eq', 'val': 'x'}}]},
+         reason='any on a to-one relationship crashes with 500', id='any-on-to-one'),
+    case({'filter': [{'or': []}]}, reason='an empty or/and filter crashes with 500', id='empty-or'),
+    case({'filter': '[' + '{"not": ' * 5000 + '{"name": "name", "op": "eq", "val": "x"}' + '}' * 5000 + ']'},
+         reason='deeply nested filters crash with 500 (RecursionError)', id='deep-nesting'),
 ])
 def test_malformed_querystring_is_a_bad_request(client, params):
     response = get(client, '/users', **params)
     assert response.status_code == 400, response.get_data(as_text=True)
 
 
-@pytest.mark.xfail(strict=True, reason=MALFORMED_INPUT)
 @pytest.mark.parametrize('method, path, body', [
-    ('POST', '/users', '{'),
-    ('POST', '/users', '[1]'),
-    ('PATCH', '/users/1', {'data': {'type': 'xf_user', 'id': '1', 'attributes': 'x'}}),
-    ('POST', '/users', {'data': {'type': 'xf_user', 'attributes': {'name': 'x'}, 'relationships': {'group': 1}}}),
+    case('POST', '/users', '{', reason='invalid JSON bodies return 500', id='invalid-json'),
+    case('POST', '/users', '[1]', reason='non-object JSON bodies return 500', id='non-object-body'),
+    case('PATCH', '/users/1', {'data': {'type': 'xf_user', 'id': '1', 'attributes': 'x'}},
+         reason='non-object attributes return 500', id='non-object-attributes'),
+    case('POST', '/users', {'data': {'type': 'xf_user', 'attributes': {'name': 'x'}, 'relationships': {'group': 1}}},
+         reason='non-object relationship values return 500', id='non-object-relationship'),
 ])
 def test_malformed_body_is_a_bad_request(client, session, method, path, body):
     response = send(client, method, path, body)
