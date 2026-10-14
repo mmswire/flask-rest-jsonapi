@@ -7,8 +7,7 @@ from sqlalchemy.orm.collections import InstrumentedList
 from sqlalchemy.inspection import inspect
 from sqlalchemy.orm.attributes import QueryableAttribute
 from sqlalchemy.orm import joinedload, ColumnProperty, RelationshipProperty
-from marshmallow import class_registry
-from marshmallow.base import SchemaABC
+from marshmallow import class_registry, Schema
 
 from flask import current_app
 from flask_rest_jsonapi.data_layers.base import BaseDataLayer
@@ -549,20 +548,23 @@ class SqlalchemyDataLayer(BaseDataLayer):
 
             if '.' in include:
                 current_schema = self.resource.schema
+                current_model = self.model
                 for obj in include.split('.'):
                     try:
                         field = get_model_field(current_schema, obj)
+                        attr = getattr(current_model, field)
                     except Exception as e:
                         raise InvalidInclude(str(e))
 
                     if joinload_object is None:
-                        joinload_object = joinedload(field)
+                        joinload_object = joinedload(attr)
                     else:
-                        joinload_object = joinload_object.joinedload(field)
+                        joinload_object = joinload_object.joinedload(attr)
+                    current_model = attr.property.mapper.class_
 
                     related_schema_cls = get_related_schema(current_schema, obj)
 
-                    if isinstance(related_schema_cls, SchemaABC):
+                    if isinstance(related_schema_cls, Schema):
                         related_schema_cls = related_schema_cls.__class__
                     else:
                         related_schema_cls = class_registry.get_class(related_schema_cls)
@@ -571,10 +573,11 @@ class SqlalchemyDataLayer(BaseDataLayer):
             else:
                 try:
                     field = get_model_field(self.resource.schema, include)
+                    attr = getattr(self.model, field)
                 except Exception as e:
                     raise InvalidInclude(str(e))
 
-                joinload_object = joinedload(field)
+                joinload_object = joinedload(attr)
 
             query = query.options(joinload_object)
 

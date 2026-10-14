@@ -129,10 +129,9 @@ html_theme = 'alabaster'
 # documentation.
 #
 html_theme_options = {
-    'github_user': 'miLibris',
+    'github_user': 'mmswire',
     'github_repo': 'flask-rest-jsonapi',
     'github_banner': True,
-    'travis_button': True,
     'show_related': True,
     'page_width': '1080px',
     'fixed_sidebar': True,

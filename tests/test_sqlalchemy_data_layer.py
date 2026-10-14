@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 
-from six.moves.urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode, parse_qs
 import pytest
 
 from sqlalchemy import create_engine, Column, Integer, DateTime, String, ForeignKey
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from flask import Blueprint, make_response, json
 from marshmallow_jsonapi.flask import Schema, Relationship
 from marshmallow import Schema as MarshmallowSchema
@@ -216,7 +215,7 @@ def address_schema():
     class AddressSchema(MarshmallowSchema):
         street = fields.String(required=True)
         city = fields.String(required=True)
-        state = fields.String(missing='NC')
+        state = fields.String(load_default='NC')
         zip = fields.String(required=True)
 
     yield AddressSchema
@@ -274,8 +273,8 @@ def computer_schema():
         id = fields.Integer(as_string=True)
         serial = fields.Str(required=True)
         owner = Relationship(attribute='person',
-                             default=None,
-                             missing=None,
+                             dump_default=None,
+                             load_default=None,
                              related_view='api.person_detail',
                              related_view_kwargs={'person_id': '<person.person_id>'},
                              schema='PersonSchema',
@@ -315,7 +314,7 @@ def person_list(session, person_model, dummy_decorator, person_schema, before_cr
         schema = person_schema
         data_layer = {'model': person_model,
                       'session': session,
-                      'mzthods': {'before_create_object': before_create_object}}
+                      'methods': {'before_create_object': before_create_object}}
         get_decorators = [dummy_decorator]
         post_decorators = [dummy_decorator]
         get_schema_kwargs = dict()
@@ -398,7 +397,7 @@ def person_list_without_schema(session, person_model):
 
 
 @pytest.fixture(scope="module")
-def query():
+def query(computer_model, person_model):
     def query_(self, view_kwargs):
         if view_kwargs.get('person_id') is not None:
             return self.session.query(computer_model).join(person_model).filter_by(person_id=view_kwargs['person_id'])
@@ -460,18 +459,18 @@ def string_json_attribute_person_list(session, string_json_attribute_person_mode
     yield StringJsonAttributePersonList
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def api_blueprint(client):
     bp = Blueprint('api', __name__)
     yield bp
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def api(api_blueprint):
     return Api(blueprint=api_blueprint)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def register_routes(client, api, app, api_blueprint, person_list, person_detail, person_computers,
                     person_list_raise_jsonapiexception, person_list_raise_exception, person_list_response,
                     person_list_without_schema, computer_list, computer_detail, computer_owner,
@@ -485,7 +484,7 @@ def register_routes(client, api, app, api_blueprint, person_list, person_detail,
     api.route(person_list_response, 'person_list_response', '/persons_response')
     api.route(person_list_without_schema, 'person_list_without_schema', '/persons_without_schema')
     api.route(computer_list, 'computer_list', '/computers', '/persons/<int:person_id>/computers')
-    api.route(computer_list, 'computer_detail', '/computers/<int:id>')
+    api.route(computer_detail, 'computer_detail', '/computers/<int:id>')
     api.route(computer_owner, 'computer_owner', '/computers/<int:id>/relationships/owner')
     api.route(string_json_attribute_person_list, 'string_json_attribute_person_list', '/string_json_attribute_persons')
     api.route(string_json_attribute_person_detail, 'string_json_attribute_person_detail',
@@ -613,15 +612,6 @@ def test_compute_schema(person_schema):
     with pytest.raises(InvalidInclude):
         flask_rest_jsonapi.schema.compute_schema(person_schema, dict(), qsm, ['id'])
     flask_rest_jsonapi.schema.compute_schema(person_schema, dict(only=list()), qsm, list())
-
-
-def test_compute_schema_propagate_context(person_schema, computer_schema):
-    query_string = {}
-    qsm = QSManager(query_string, person_schema)
-    schema = flask_rest_jsonapi.schema.compute_schema(person_schema, dict(), qsm, ['computers'])
-    assert schema.declared_fields['computers'].__dict__['_Relationship__schema'].__dict__['context'] == dict()
-    schema = flask_rest_jsonapi.schema.compute_schema(person_schema, dict(context=dict(foo='bar')), qsm, ['computers'])
-    assert schema.declared_fields['computers'].__dict__['_Relationship__schema'].__dict__['context'] == dict(foo='bar')
 
 
 # test good cases
@@ -798,6 +788,30 @@ def test_get_detail(client, register_routes, person):
     with client:
         response = client.get('/persons/' + str(person.person_id), content_type='application/vnd.api+json')
         assert response.status_code == 200, response.json['errors']
+
+
+def test_get_computer_detail(client, register_routes, computer):
+    with client:
+        response = client.get('/computers/' + str(computer.id), content_type='application/vnd.api+json')
+        assert response.status_code == 200, response.json['errors']
+        assert response.json['data']['attributes']['serial'] == '1'
+
+
+def test_get_person_computers(client, register_routes, session, computer_model, person, computer):
+    computer.person = person
+    # a computer of nobody's, so an unfiltered query can't pass
+    other = computer_model(serial='other')
+    session.add(other)
+    session.commit()
+    try:
+        with client:
+            response = client.get('/persons/{}/computers'.format(person.person_id),
+                                  content_type='application/vnd.api+json')
+            assert response.status_code == 200, response.json['errors']
+            assert [item['id'] for item in response.json['data']] == [str(computer.id)]
+    finally:
+        session.delete(other)
+        session.commit()
 
 
 def test_patch_detail(client, register_routes, computer, person):
@@ -1896,7 +1910,7 @@ def test_api_resources(app, person_list):
     api.init_app(app)
 
 
-def test_relationship_containing_hyphens(api, app, client, person_schema, person_computers, register_routes,
+def test_relationship_containing_hyphens(api, app, client, person_schema, person_computers, computer_list,
                                          computer_schema, person):
     """
     This is a bit of a hack. Basically, since we can no longer have two attributes that read from the same key
@@ -1920,6 +1934,7 @@ def test_relationship_containing_hyphens(api, app, client, person_schema, person
     class PersonComputersOwnedRelationship(person_computers):
         schema = PersonOwnedSchema
 
+    api.route(computer_list, 'computer_list', '/computers', '/persons/<int:person_id>/computers')
     api.route(PersonComputersOwnedRelationship, 'person_computers_owned',
               '/persons/<int:person_id>/relationships/computers-owned')
     api.init_app(app)

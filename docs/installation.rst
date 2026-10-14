@@ -7,13 +7,13 @@ Installation
 
 Install Flask-REST-JSONAPI with ``pip`` ::
 
-    pip install flask-rest-jsonapi
+    pip install git+https://github.com/mmswire/flask-rest-jsonapi.git
 
 
 The development version can be downloaded from `its page at GitHub
-<https://github.com/miLibris/flask-rest-jsonapi>`_. ::
+<https://github.com/mmswire/flask-rest-jsonapi>`_. ::
 
-    git clone https://github.com/miLibris/flask-rest-jsonapi.git
+    git clone https://github.com/mmswire/flask-rest-jsonapi.git
     cd flask-rest-jsonapi
     mkvirtualenv venv
     python setup.py install

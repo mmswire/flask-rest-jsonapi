@@ -4,7 +4,6 @@
 
 import inspect
 import json
-from six import with_metaclass
 
 from werkzeug.wrappers import Response
 from flask import request, url_for, make_response
@@ -107,7 +106,7 @@ class Resource(MethodView):
         return make_response(json_reponse, status_code, headers)
 
 
-class ResourceList(with_metaclass(ResourceMeta, Resource)):
+class ResourceList(Resource, metaclass=ResourceMeta):
     """Base class of a resource list manager"""
 
     @check_method_requirements
@@ -231,7 +230,7 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
         return self._data_layer.create_object(data, kwargs)
 
 
-class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
+class ResourceDetail(Resource, metaclass=ResourceMeta):
     """Base class of a resource detail manager"""
 
     @check_method_requirements
@@ -357,7 +356,7 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
         self._data_layer.delete_object(obj, kwargs)
 
 
-class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
+class ResourceRelationship(Resource, metaclass=ResourceMeta):
     """Base class of a resource relationship manager"""
 
     @check_method_requirements
